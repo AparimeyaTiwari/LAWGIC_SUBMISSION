@@ -34,6 +34,8 @@ import json
 from azure.ai.inference import EmbeddingsClient
 from azure.core.credentials import AzureKeyCredential
 from openai import AzureOpenAI
+import azure.cognitiveservices.speech as speechsdk
+from langdetect import detect, LangDetectException
 
 # Load prompts
 with open("prompt.txt", "r") as f:
@@ -71,27 +73,108 @@ chat_client = AzureOpenAI(
     azure_endpoint=endpoint
 )
 
+# Simplified language options - only English and Hindi
+language_options = {
+    "english": "en-IN",
+    "hindi": "hi-IN",
+    "marathi": "mr-IN",
+    "bengali": "bn-IN",
+    "gujarati": "gu-IN",
+    "kannada": "kn-IN",
+    "malayalam": "ml-IN",
+    "punjabi": "pa-IN",
+    "tamil": "ta-IN",
+    "telugu": "te-IN",
+    "urdu": "ur-IN"
+}
+
+# Mapping from language code to Azure voice names
+language_to_voice = {
+    'en': 'en-IN-NeerjaNeural',
+    'hi': 'hi-IN-SwaraNeural',
+    'bn': 'bn-IN-TanishaaNeural',
+    'gu': 'gu-IN-DhwaniNeural',
+    'kn': 'kn-IN-SapnaNeural',
+    'ml': 'ml-IN-SobhanaNeural',
+    'mr': 'mr-IN-AarohiNeural',
+    'pa': 'pa-IN-GaganNeural',
+    'ta': 'ta-IN-PallaviNeural',
+    'te': 'te-IN-MohanNeural',
+    'ur': 'ur-IN-SalmanNeural'
+}
+
+def get_speech_config(language_code="en-IN"):
+    """Get Azure Speech SDK configuration"""
+    speech_key = os.getenv("SPEECH_KEY")
+    speech_region = os.getenv("SPEECH_REGION")
+    if not speech_key or not speech_region:
+        raise RuntimeError("Azure credentials missing")
+    config = speechsdk.SpeechConfig(subscription=speech_key, region=speech_region)
+    config.speech_recognition_language = language_code
+    return config
+
+async def recognize_speech(language_locale="en-IN"):
+    """Recognize speech from microphone with specified language"""
+    speech_config = get_speech_config(language_locale)
+    audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+
+    try:
+        loop = asyncio.get_running_loop()
+        future = recognizer.recognize_once_async()
+        result = await loop.run_in_executor(None, future.get)
+
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            return result.text.strip(), language_locale[:2]  # Return text and language code
+        elif result.reason == speechsdk.ResultReason.NoMatch:
+            raise ValueError("No speech detected")
+        else:
+            raise ValueError(f"Recognition error: {result.cancellation_details.reason}")
+    except Exception as e:
+        raise ValueError(f"Speech recognition failed: {str(e)}")
+
+async def synthesize_speech(text: str, language_code: str = None):
+    """Convert text to speech with automatic language detection"""
+    try:
+        if not language_code:
+            try:
+                language_code = detect(text)
+            except LangDetectException:
+                language_code = 'en'  # Fallback to English
+        
+        voice_name = language_to_voice.get(language_code, 'en-IN-NeerjaNeural')
+        
+        speech_config = get_speech_config()
+        speech_config.speech_synthesis_voice_name = voice_name
+        # Use default speaker with async
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
+        
+        # Use async synthesis with proper await
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: synthesizer.speak_text(text))
+        
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            return True
+        elif result.reason == speechsdk.ResultReason.Canceled:
+            details = result.cancellation_details
+            raise RuntimeError(f"TTS canceled: {details.reason} - {details.error_details}")
+        return False
+    except Exception as e:
+        raise RuntimeError(f"TTS error: {str(e)}")
+
 async def embedder(text: str):
-    # data = {
-    #     "input": [text]
-    # }
-    # response = requests.post(
-    #     EMBEDDINGEP,
-    #     headers=headers,
-    #     json=data
-    # )
     data = {
         "input": [text]
     }
     headers = {
         "Content-Type": "application/json",
-        "api-key": empkey  # or "Authorization" depending on your API
+        "api-key": empkey
     }
 
     response = requests.post(EMBEDDINGEP, headers=headers, json=data)
     
     try:
-        response.raise_for_status()  # Raise HTTPError if status != 200
+        response.raise_for_status()
         resp_json = response.json()
         
         if "data" not in resp_json:
@@ -100,7 +183,6 @@ async def embedder(text: str):
     except:
         print(f"Error in embedding request: {response.status_code} - {response.text}")
         return None
-
     
 def chunker(ip, chunk_size=10000):
     return [ip[i:i + chunk_size] for i in range(0, len(ip), chunk_size)]
@@ -134,12 +216,12 @@ gmaps = None
 # initialize translator key and endpoint
 language_map = {
     'hi': 'Hindi',
+    'en': 'English',
     'mr': 'Marathi',
     'gu': 'Gujarati',
     'kn': 'Kannada',
     'ta': 'Tamil',
     'te': 'Telugu',
-    'en': 'English',
     'bn': 'Bengali',
     'pa': 'Punjabi',
     'ml': 'Malayalam',
@@ -174,6 +256,7 @@ ocr_endpoint = os.getenv("VISION_ENDPOINT")
 
 # Authenticate
 computervision_client = ComputerVisionClient(ocr_endpoint, CognitiveServicesCredentials(subscription_key))
+
 async def ocr(file_path: str) -> str:
     """
     Performs OCR on the given file using Azure Computer Vision and returns extracted text.
@@ -322,6 +405,200 @@ async def initialize_chat():
     
     # Initialize Google Maps client
     gmaps = googlemaps.Client(key=os.getenv("GOOGLE_MAPS_API_KEY"))
+
+    # Send initial message with actions
+    await send_input_options()
+
+async def send_input_options():
+    """Helper function to send input options"""
+    actions = [
+        cl.Action(
+            name="english_voice",
+            value="en-IN",
+            label="🗣️ English Voice",
+            description="Speak in English",
+            payload={"type": "voice", "language": "en-IN"}
+        ),
+        cl.Action(
+            name="hindi_voice",
+            value="hi-IN",
+            label="🗣️ Hindi Voice (हिंदी)",
+            description="हिंदी में बोलें",
+            payload={"type": "voice", "language": "hi-IN"}
+        ),
+
+        cl.Action(
+            name="text_input",
+            value="text",
+            label="✏️ Text Input",
+            description="Type your message",
+            payload={"type": "text"}
+        ),
+        cl.Action(
+            name="marathi_voice",
+            value="mr-IN",
+            label="🗣️ Marathi Voice (मराठी)",
+            description="मराठीत बोला",
+            payload={"type": "voice", "language": "mr-IN"}
+        ),
+        cl.Action(
+            name="bengali_voice",
+            value="bn-IN",
+            label="🗣️ Bengali Voice (বাংলা)",
+            description="বাংলায় বলুন",
+            payload={"type": "voice", "language": "bn-IN"}
+        ),
+        cl.Action(
+            name="gujarati_voice",
+            value="gu-IN",
+            label="🗣️ Gujarati Voice (ગુજરાતી)",
+            description="ગુજરાતીમાં બોલો",
+            payload={"type": "voice", "language": "gu-IN"}
+        ),
+        cl.Action(
+            name="kannada_voice",
+            value="kn-IN",
+            label="🗣️ Kannada Voice (ಕನ್ನಡ)",
+            description="ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ",
+            payload={"type": "voice", "language": "kn-IN"}
+        ),
+        cl.Action(
+            name="malayalam_voice",
+            value="ml-IN",
+            label="🗣️ Malayalam Voice (മലയാളം)",
+            description="മലയാളത്തിൽ സംസാരിക്കുക",
+            payload={"type": "voice", "language": "ml-IN"}
+        ),
+        cl.Action(
+            name="punjabi_voice",
+            value="pa-IN",
+            label="🗣️ Punjabi Voice (ਪੰਜਾਬੀ)",
+            description="ਪੰਜਾਬੀ ਵਿੱਚ ਗੱਲ ਕਰੋ",
+            payload={"type": "voice", "language": "pa-IN"}
+        ),
+        cl.Action(
+            name="tamil_voice",
+            value="ta-IN",
+            label="🗣️ Tamil Voice (தமிழ்)",
+            description="தமிழில் பேசுங்கள்",
+            payload={"type": "voice", "language": "ta-IN"}
+        ),
+        cl.Action(
+            name="telugu_voice",
+            value="te-IN",
+            label="🗣️ Telugu Voice (తెలుగు)",
+            description="తెలుగులో మాట్లాడండి",
+            payload={"type": "voice", "language": "te-IN"}
+        ),
+        cl.Action(
+            name="urdu_voice",
+            value="ur-IN",
+            label="🗣️ Urdu Voice (اردو)",
+            description="اردو میں بات کریں",
+            payload={"type": "voice", "language": "ur-IN"}
+        )
+    ]
+
+    await cl.Message(content="How would you like to provide input?", actions=actions).send()
+
+async def handle_voice_input(language_locale: str):
+    """Common handler for voice input in any language"""
+    try:
+        listening_msg = await cl.Message(content=f"🎤 Listening in {language_locale[:2].upper()}... (Speak now)").send()
+        transcript, detected_lang = await recognize_speech(language_locale)
+        await listening_msg.remove()
+        
+        # Store detected language in session
+        cl.user_session.set("detected_lang", detected_lang)
+        
+        # Create a message with the transcript and process it
+        msg = cl.Message(content=transcript)
+        await msg.send()
+        
+        # Process the message through the normal flow
+        await handle_message(msg)
+        
+    except Exception as e:
+        await cl.Message(content=f"❌ Voice input error: {str(e)}").send()
+
+@cl.action_callback("english_voice")
+async def on_english_voice(action: cl.Action):
+    """Handle English voice input"""
+    await handle_voice_input("en-IN")
+
+@cl.action_callback("hindi_voice")
+async def on_hindi_voice(action: cl.Action):
+    """Handle Hindi voice input"""
+    await handle_voice_input("hi-IN")
+
+@cl.action_callback("marathi_voice")
+async def on_marathi_voice(action: cl.Action):
+    """Handle Marathi voice input"""
+    await handle_voice_input("mr-IN")
+
+@cl.action_callback("bengali_voice")
+async def on_bengali_voice(action: cl.Action):
+    """Handle Bengali voice input"""
+    await handle_voice_input("bn-IN")
+
+@cl.action_callback("gujarati_voice")
+async def on_gujarati_voice(action: cl.Action):
+    """Handle Gujarati voice input"""
+    await handle_voice_input("gu-IN")
+
+@cl.action_callback("kannada_voice")
+async def on_kannada_voice(action: cl.Action):
+    """Handle Kannada voice input"""
+    await handle_voice_input("kn-IN")
+
+@cl.action_callback("malayalam_voice")
+async def on_malayalam_voice(action: cl.Action):
+    """Handle Malayalam voice input"""
+    await handle_voice_input("ml-IN")
+
+@cl.action_callback("punjabi_voice")
+async def on_punjabi_voice(action: cl.Action):
+    """Handle Punjabi voice input"""
+    await handle_voice_input("pa-IN")
+
+@cl.action_callback("tamil_voice")
+async def on_tamil_voice(action: cl.Action):
+    """Handle Tamil voice input"""
+    await handle_voice_input("ta-IN")
+
+@cl.action_callback("telugu_voice")
+async def on_telugu_voice(action: cl.Action):
+    """Handle Telugu voice input"""
+    await handle_voice_input("te-IN")
+
+@cl.action_callback("urdu_voice")
+async def on_urdu_voice(action: cl.Action):
+    """Handle Urdu voice input"""
+    await handle_voice_input("ur-IN")
+
+@cl.action_callback("text_input")
+async def on_text_input(action: cl.Action):
+    """Handle text input selection"""
+    await cl.Message(content="Please type your message in the chat").send()
+
+@cl.action_callback("tts_command")
+async def on_tts_command(action: cl.Action):
+    """Handle TTS command for a message"""
+    try:
+        # Get the text from the action payload
+        text_to_speak = action.payload["text"]
+        detected_lang = cl.user_session.get("detected_lang", "en")
+        
+        status_msg = await cl.Message(content="🔊 Preparing speech...").send()
+        success = await synthesize_speech(text_to_speak, detected_lang)
+        await status_msg.remove()
+        
+        if not success:
+            await cl.Message(content="⚠️ Could not generate speech for this message").send()
+    except KeyError:
+        await cl.Message(content="❌ Error: No text found to speak").send()
+    except Exception as e:
+        await cl.Message(content=f"❌ TTS Error: {str(e)}").send()
 
 async def extract_city_from_message(message: str) -> Optional[str]:
     """Extracts standardized city name from current message"""
@@ -557,18 +834,29 @@ async def get_lawyer_recommendations(coords: str, lawyer_type: str) -> str:
 
 @cl.on_message
 async def handle_message(message: cl.Message):
-    
     # Get current chat history
     chat_history: List[Dict[str, Any]] = cl.user_session.get("chat_history", [])
+
+    # Check if this is a voice input follow-up
+    is_voice_input = message.content.startswith("🎤")  # Simple check for voice input
+    detected_lang = cl.user_session.get("detected_lang", "en")
+
+    # Keep only last 20 messages to prevent unlimited growth
+    MAX_HISTORY = 20
+    chat_history = chat_history[-MAX_HISTORY:]
     
     # Add user message to history
     chat_history.append({
         "role": "user",
         "content": message.content,
-        "timestamp": datetime.now().strftime("%H:%M:%S")
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "input_mode": "voice" if is_voice_input else "text"
     })
+
+    # Send input options after each message
+    await send_input_options()
     
-    # Handle file attachments (keep your existing file handling code)
+    # Handle file attachments
     if message.elements:
         processing_msg = await cl.Message(content="📄 Analyzing document...").send()
         analyses = []
@@ -585,7 +873,19 @@ async def handle_message(message: cl.Message):
                 "timestamp": datetime.now().strftime("%H:%M:%S")
             })
             
-            await cl.Message(content="\n\n".join(analyses)).send()
+            # Create response message with TTS action
+            response_content = "\n\n".join(analyses)
+            actions = [
+                cl.Action(
+                    name="tts_command",
+                    value=response_content,
+                    label="🗣️ Speak Response",
+                    description="Hear the response",
+                    payload={"text": response_content}
+                )
+            ]
+            await cl.Message(content=response_content, actions=actions).send()
+            
             await processing_msg.remove()
             return
     
@@ -593,7 +893,13 @@ async def handle_message(message: cl.Message):
     processing_msg = await cl.Message(content="🔍 Analyzing your query...").send()
     
     try:
-        translated_text, langd = await detect_and_translate_to_english(message.content)
+        # Get the original text (remove voice prefix if present)
+        original_text = message.content.replace("🎤 You said: ", "") if is_voice_input else message.content
+        
+        # Translate to English if needed
+        translated_text, detected_lang = await detect_and_translate_to_english(original_text)
+        cl.user_session.set("detected_lang", detected_lang)
+        
         legal_plugin = cl.user_session.get("legal_plugin")
         
         # First determine if this is a legal query or casual chat
@@ -699,7 +1005,7 @@ async def handle_message(message: cl.Message):
             # Get location-aware legal advice with context
             user_location = await get_user_location(translated_text)
             advice_text = str(response).strip()
-            trans_op = await translate_back_to_original(advice_text, langd)
+            trans_op = await translate_back_to_original(advice_text, detected_lang)
             
             # Add assistant response to history
             chat_history.append({
@@ -721,6 +1027,7 @@ async def handle_message(message: cl.Message):
             # Remove the processing message first
             await processing_msg.remove()
             
+            # Create the response message
             if "YES" in needs_lawyer:
                 lawyer_type = await kernel.invoke(
                     legal_plugin["lawyer_type"],
@@ -733,12 +1040,50 @@ async def handle_message(message: cl.Message):
                 
                 # Update the final message in history
                 chat_history[-1]["content"] = final_content
-                await cl.Message(content=final_content).send()
-            else:
-                await cl.Message(content=f"✅ Advice:\n{trans_op}").send()
                 
+                # Create response message with TTS action
+                actions = [
+                    cl.Action(
+                        name="tts_command",
+                        value=final_content,
+                        label="🗣️ Speak Response",
+                        description="Hear the response",
+                        payload={"text": final_content}
+                    )
+                ]
+                await cl.Message(content=final_content, actions=actions).send()
+                
+                # Speak the response automatically if this was a voice input
+                if is_voice_input:
+                    try:
+                        await synthesize_speech(trans_op, detected_lang)
+                    except Exception as e:
+                        await cl.Message(content=f"⚠️ Could not generate audio: {str(e)}").send()
+                
+            else:
+                actions = [
+                    cl.Action(
+                        name="tts_command",
+                        value=trans_op,
+                        label="🗣️ Speak Response",
+                        description="Hear the response",
+                        payload={"text": trans_op}
+                    )
+                ]
+                await cl.Message(content=f"✅ Advice:\n{trans_op}", actions=actions).send()
+                
+                # Speak the response automatically if this was a voice input
+                if is_voice_input:
+                    try:
+                        await synthesize_speech(trans_op, detected_lang)
+                    except Exception as e:
+                        await cl.Message(content=f"⚠️ Could not generate audio: {str(e)}").send()
+            
             # Update the chat history in session
             cl.user_session.set("chat_history", chat_history)
+            
+            # Remove processing message
+            await processing_msg.remove()
                 
     except Exception as e:
         error_msg = f"❌ Processing error: {str(e)}"
